@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>AI Avatar</title>
+  <style>
+    body { margin:0; overflow:hidden; background:#000; font-family: Arial, sans-serif; color:#fff; }
+    #ui{
+      position:absolute; top:12px; left:12px; z-index:10;
+      background:rgba(0,0,0,.55); padding:10px 12px; border-radius:10px;
+      display:flex; gap:10px; align-items:center; max-width:1000px;
+      flex-wrap: wrap;
+    }
+    #talkBtn, #sendBtn{
+      padding:8px 14px; border:0; border-radius:8px;
+      background:#22d3ee; color:#06121a; font-weight:700; cursor:pointer;
+    }
+    #talkBtn:disabled, #sendBtn:disabled{ opacity:.6; cursor:not-allowed; }
+    #textInput{
+      width:280px; max-width:40vw;
+      padding:8px 10px; border-radius:8px; border:0;
+      outline:none; font-size:14px;
+    }
+    #status{
+  font-size:13px;
+  white-space:pre-line;
+  line-height:1.25;
+  margin-left:10px;
+}
+    canvas{ display:block; width:100vw; height:100vh; }
+  </style>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+
+<body>
+  <div id="ui">
+    <button id="talkBtn">🎤 Talk</button>
+    <input id="textInput" type="text" placeholder="Type a question..." />
+    <button id="sendBtn">Send</button>
+    <div id="status">Booting…</div>
+  </div>
+  <canvas id="canvas"></canvas>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+
+    const canvas = document.getElementById("canvas");
+    const talkBtn = document.getElementById("talkBtn");
+    const sendBtn = document.getElementById("sendBtn");
+    const textInput = document.getElementById("textInput");
+    const statusEl = document.getElementById("status");
+    const setStatus = (t) => (statusEl.textContent = t);
+
+    const clamp01 = (v) => Math.max(0, Math.min(1, v));
+    const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+
+    let selectedVoice = null;
+
+    function chooseMaleVoice() {
+      const voices = speechSynthesis.getVoices();
+      if (!voices.length) return null;
+
+      const preferredNames = [
+        "Microsoft Guy Online (Natural)",
+        "Microsoft Davis Online (Natural)",
+        "Microsoft David",
+        "Google US English",
+        "Daniel",
+        "Alex"
+      ];
+
+      for (const preferred of preferredNames) {
+        const match = voices.find(v => v.name.toLowerCase().includes(preferred.toLowerCase()));
+        if (match) return match;
+      }
+
+      const maleKeywords = ["male", "guy", "david", "davis", "daniel", "alex"];
+      for (const keyword of maleKeywords) {
+        const match = voices.find(v => v.name.toLowerCase().includes(keyword));
+        if (match) return match;
+      }
+
+      return voices.find(v => v.lang && v.lang.startsWith("en")) || voices[0];
+    }
+
+    function loadVoices() {
+      selectedVoice = chooseMaleVoice();
+      if (selectedVoice) {
+        console.log("Using voice:", selectedVoice.name);
+      }
+    }
+
+    speechSynthesis.onvoiceschanged = loadVoices;
+    loadVoices();
+
+    function pickMorph(dict, patterns) {
+      if (!dict) return null;
+      const keys = Object.keys(dict);
+      const nk = keys.map(k => [k, norm(k)]);
+      for (const p of patterns) {
+        const np = norm(p);
+        const hit = nk.find(([, x]) => x.includes(np));
+        if (hit) return hit[0];
+      }
+      return null;
+    }
+
+    function collectMorphMeshes(root) {
+      const out = [];
+      root.traverse((o) => {
+        if (o.isMesh && o.morphTargetDictionary && o.morphTargetInfluences) out.push(o);
+      });
+      return out;
+    }
+
+    function createFaceController(root) {
+      const meshes = collectMorphMeshes(root);
+      if (!meshes.length) return null;
+
+      let jawName=null, smileName=null, blinkL=null, blinkR=null;
+
+      for (const m of meshes) {
+        const d = m.morphTargetDictionary;
+        jawName   = jawName   || pickMorph(d, ["jawOpen","mouthOpen","open","viseme_aa","visemeAA","aa"]);
+        smileName = smileName || pickMorph(d, ["smile","mouthSmile","happy"]);
+        blinkL    = blinkL    || pickMorph(d, ["eyeBlinkLeft","blinkLeft","eyeCloseLeft"]);
+        blinkR    = blinkR    || pickMorph(d, ["eyeBlinkRight","blinkRight","eyeCloseRight"]);
+      }
+
+      function setMorph(name, v) {
+        if (!name) return;
+        const value = clamp01(v);
+        for (const m of meshes) {
+          const idx = m.morphTargetDictionary?.[name];
+          if (idx === undefined) continue;
+          m.morphTargetInfluences[idx] = value;
+        }
+      }
+
+      return {
+        jawName, smileName, blinkL, blinkR,
+        setJaw:   (v) => setMorph(jawName, v),
+        setSmile: (v) => setMorph(smileName, v),
+        setBlink: (v) => { setMorph(blinkL, v); setMorph(blinkR, v); }
+      };
+    }
+
+    function findBone(root, patterns) {
+      let found = null;
+      root.traverse((o) => {
+        if (found) return;
+        if (!o.isBone) return;
+        const n = norm(o.name);
+        for (const p of patterns) {
+          if (n.includes(norm(p))) { found = o; return; }
+        }
+      });
+      return found;
+    }
+
+    setStatus("JS running ✅\nSetting up scene…");
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(35, window.innerWidth / window.innerHeight, 0.05, 2000);
+    camera.position.set(0, 1.25, 2.0);
+
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+    const key = new THREE.DirectionalLight(0xffffff, 1.35);
+    key.position.set(2.0, 4.0, 2.0);
+    scene.add(key);
+
+    const fill = new THREE.DirectionalLight(0xffffff, 0.5);
+    fill.position.set(-2.5, 2.5, 2.0);
+    scene.add(fill);
+
+    const rim = new THREE.DirectionalLight(0xffffff, 0.5);
+    rim.position.set(0, 3.5, -3.0);
+    scene.add(rim);
+
+    const avatarRoot = new THREE.Group();
+    scene.add(avatarRoot);
+
+    const cube = new THREE.Mesh(
+      new THREE.BoxGeometry(0.6, 0.9, 0.6),
+      new THREE.MeshStandardMaterial({ color: 0x22d3ee, roughness: 0.35 })
+    );
+    cube.position.set(0, 1.0, 0);
+    avatarRoot.add(cube);
+
+    let avatar = null;
+    let face = null;
+
+    let boneChest=null, boneNeck=null, boneHead=null;
+    const baseRot = { chest:null, neck:null, head:null };
+
+    let isTalking = false;
+    let lipTimer = null;
+    let jawTarget = 0;
+    let jawCurrent = 0;
+
+    function setTalking(on) {
+      isTalking = on;
+      if (on) startLipSync();
+      else stopLipSync();
+    }
+
+    function startLipSync() {
+      if (lipTimer) return;
+      lipTimer = setInterval(() => {
+        if (!isTalking) return;
+        jawTarget = 0.10 + Math.random() * 0.55;
+        if (face?.smileName) face.setSmile(0.08);
+      }, 65);
+    }
+
+    function stopLipSync() {
+      if (lipTimer) clearInterval(lipTimer);
+      lipTimer = null;
+      jawTarget = 0;
+      if (face?.jawName) face.setJaw(0);
+      if (face?.smileName) face.setSmile(0.12);
+    }
+
+    function blinkOnce() {
+      if (!face) return;
+      if (!face.blinkL && !face.blinkR) return;
+      face.setBlink(1);
+      setTimeout(() => face.setBlink(0), 120);
+    }
+
+    function startBlinkLoop() {
+      const loop = () => {
+        const delay = 2200 + Math.random() * 4200;
+        setTimeout(() => { blinkOnce(); loop(); }, delay);
+      };
+      loop();
+    }
+
+    function speak(text) {
+      if (!text) return;
+
+      if (!selectedVoice) loadVoices();
+
+      const u = new SpeechSynthesisUtterance(text);
+      if (selectedVoice) u.voice = selectedVoice;
+
+      u.rate = 1;
+      u.pitch = 0.95;
+      u.volume = 1;
+
+      u.onstart = () => setTalking(true);
+      u.onend = () => setTalking(false);
+      u.onerror = () => setTalking(false);
+
+      speechSynthesis.cancel();
+      speechSynthesis.speak(u);
+    }
+
+    function centerScaleAndFrameUpperBody(obj) {
+      const box = new THREE.Box3().setFromObject(obj);
+      const size = new THREE.Vector3();
+      const center = new THREE.Vector3();
+      box.getSize(size);
+      box.getCenter(center);
+
+      obj.position.sub(center);
+
+      const height = Math.max(0.0001, size.y);
+      const targetHeight = 1.75;
+      obj.scale.multiplyScalar(targetHeight / height);
+
+      const box2 = new THREE.Box3().setFromObject(obj);
+      const minY = box2.min.y;
+      const maxY = box2.max.y;
+      const fullH = maxY - minY;
+
+      const waistY = minY + fullH * 0.55;
+      const chestY = minY + fullH * 0.78;
+
+      obj.position.y -= waistY;
+      obj.position.y -= 0.10;
+
+      const torsoH = (maxY - waistY);
+      const dist = Math.max(1.1, torsoH * 1.55);
+
+      camera.fov = 34;
+      camera.updateProjectionMatrix();
+
+      camera.position.set(0, (chestY - waistY) + 0.05, dist);
+      camera.lookAt(0, (chestY - waistY) + 0.05, 0);
+    }
+
+    setStatus("Loading /avatar.glb …");
+    const loader = new GLTFLoader();
+    loader.load(
+      "/avatar.glb",
+      (gltf) => {
+        avatar = gltf.scene;
+
+        avatarRoot.remove(cube);
+        avatarRoot.add(avatar);
+
+        centerScaleAndFrameUpperBody(avatar);
+
+        face = createFaceController(avatar);
+        if (face?.smileName) face.setSmile(0.12);
+
+        boneChest = findBone(avatar, ["upperchest", "chest", "spine2"]);
+        boneNeck  = findBone(avatar, ["neck"]);
+        boneHead  = findBone(avatar, ["head"]);
+
+        if (boneChest) baseRot.chest = boneChest.rotation.clone();
+        if (boneNeck)  baseRot.neck  = boneNeck.rotation.clone();
+        if (boneHead)  baseRot.head  = boneHead.rotation.clone();
+
+        setStatus("Avatar loaded ✅\nReady.");
+        startBlinkLoop();
+      },
+      undefined,
+      (err) => {
+        console.error("GLB load error:", err);
+        setStatus("Avatar failed ❌\nUsing cube fallback.\nCheck Console (F12).");
+      }
+    );
+
+    async function sendMessage(message) {
+      const text = String(message || "").trim();
+      if (!text) return;
+
+      setStatus(`You: ${text}\nThinking…`);
+
+      try {
+        const res = await fetch("/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: text })
+        });
+        const data = await res.json();
+        const reply = data?.reply || "I didn't get a reply.";
+
+        setStatus(`You: ${text}\nBot: ${reply}`);
+        speak(reply);
+      } catch (e) {
+        console.error(e);
+        setStatus("Failed to reach /chat.\nIs the server running?");
+      }
+    }
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      talkBtn.disabled = true;
+      setStatus(statusEl.textContent + "\n\nMic STT not supported in this browser.");
+    } else {
+      const rec = new SpeechRecognition();
+      rec.lang = "en-US";
+      rec.continuous = false;
+      rec.interimResults = false;
+
+      talkBtn.addEventListener("click", () => {
+        try {
+          rec.start();
+          talkBtn.textContent = "🎙️ Listening...";
+          setStatus("Listening…");
+        } catch {}
+      });
+
+      rec.onresult = async (event) => {
+        const text = event.results[0][0].transcript;
+        talkBtn.textContent = "🎤 Talk";
+        await sendMessage(text);
+      };
+
+      rec.onerror = (e) => {
+        talkBtn.textContent = "🎤 Talk";
+        setStatus(`Mic error: ${e.error || "unknown"}`);
+      };
+
+      rec.onend = () => { talkBtn.textContent = "🎤 Talk"; };
+    }
+
+    sendBtn.addEventListener("click", async () => {
+      const text = textInput.value;
+      textInput.value = "";
+      await sendMessage(text);
+    });
+
+    textInput.addEventListener("keydown", async (e) => {
+      if (e.key === "Enter") {
+        const text = textInput.value;
+        textInput.value = "";
+        await sendMessage(text);
+      }
+    });
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const t = Date.now() * 0.001;
+
+      jawCurrent += (jawTarget - jawCurrent) * 0.22;
+      if (face?.jawName) face.setJaw(jawCurrent);
+
+      avatarRoot.rotation.y = Math.sin(t * 0.25) * 0.02;
+      avatarRoot.position.y = Math.sin(t * 1.1) * 0.006;
+
+      const breathe = Math.sin(t * 1.1) * 0.012;
+      const sway    = Math.sin(t * 0.7) * 0.010;
+      const talkNod = isTalking ? Math.sin(t * 5.8) * 0.015 : 0;
+
+      if (boneChest && baseRot.chest) {
+        boneChest.rotation.x = baseRot.chest.x + breathe;
+        boneChest.rotation.z = baseRot.chest.z + sway;
+      }
+      if (boneNeck && baseRot.neck) {
+        boneNeck.rotation.y = baseRot.neck.y + Math.sin(t * 0.5) * 0.018;
+      }
+      if (boneHead && baseRot.head) {
+        boneHead.rotation.x = baseRot.head.x + Math.sin(t * 0.6) * 0.010 + talkNod;
+        boneHead.rotation.y = baseRot.head.y + Math.sin(t * 0.45) * 0.020;
+      }
+
+      cube.rotation.y += 0.01;
+
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
