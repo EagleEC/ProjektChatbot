@@ -14,7 +14,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const port = 3000;
 
-const publicDir = path.join(__dirname, "public");
+const publicDir = path.join(__dirname );
 const indexPath = path.join(publicDir, "index.html");
 
 app.use(cors());
